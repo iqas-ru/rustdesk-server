@@ -40,7 +40,7 @@ jobs:
           tool: cross
 
       - name: Test access module
-        run: cargo test --lib access::
+        run: cargo test --lib access
 
       - name: Build
         run: cross build --release --target ${{ env.TARGET }}
