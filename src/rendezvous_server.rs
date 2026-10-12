@@ -88,6 +88,49 @@ async fn record_punch_req(from_ip: String, to_ip: String, to_id: String) {
     }
 }
 
+// Access mode: employee that authorised a requester socket / (ip, target id)
+type Grant = (Arc<crate::access::Emp>, Instant);
+static AUTH: Lazy<std::sync::Mutex<HashMap<SocketAddr, Grant>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+static AUTH_IP: Lazy<std::sync::Mutex<HashMap<(IpAddr, String), Grant>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+const AUTH_TTL: u64 = 120;
+
+fn grant(addr: SocketAddr, id: Option<&str>, emp: &Arc<crate::access::Emp>) {
+    let addr = try_into_v4(addr);
+    let now = Instant::now();
+    if let Ok(mut lock) = AUTH.lock() {
+        lock.retain(|_, v| v.1.elapsed().as_secs() < AUTH_TTL);
+        lock.insert(addr, (emp.clone(), now));
+    }
+    if let Some(id) = id {
+        if let Ok(mut lock) = AUTH_IP.lock() {
+            lock.retain(|_, v| v.1.elapsed().as_secs() < AUTH_TTL);
+            lock.insert((addr.ip(), id.to_owned()), (emp.clone(), now));
+        }
+    }
+}
+
+// Still active employee that authorised `addr` (and `id` if given)
+fn granted(addr: SocketAddr, id: Option<&str>) -> Option<Arc<crate::access::Emp>> {
+    let addr = try_into_v4(addr);
+    let emp = match id {
+        Some(id) => AUTH_IP
+            .lock()
+            .ok()?
+            .get(&(addr.ip(), id.to_owned()))
+            .filter(|v| v.1.elapsed().as_secs() < AUTH_TTL)
+            .map(|v| v.0.clone())?,
+        None => AUTH
+            .lock()
+            .ok()?
+            .get(&addr)
+            .filter(|v| v.1.elapsed().as_secs() < AUTH_TTL)
+            .map(|v| v.0.clone())?,
+    };
+    crate::access::get(&emp.pk)
+}
+
 #[derive(Clone)]
 struct Inner {
     serial: i32,
@@ -131,6 +174,7 @@ impl RendezvousServer {
         rmem: usize,
     ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key)?;
+        crate::access::spawn_reloader();
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
@@ -544,6 +588,21 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                        if crate::access::on() {
+                            // only after a fresh punch hole grant, with minimal fields
+                            match granted(addr, Some(rf.id.as_str())) {
+                                Some(emp) => grant(addr, None, &emp),
+                                None => return true,
+                            }
+                            rf = RequestRelay {
+                                id: rf.id,
+                                uuid: rf.uuid,
+                                relay_server: rf.relay_server,
+                                secure: rf.secure,
+                                conn_type: rf.conn_type,
+                                ..Default::default()
+                            };
+                        }
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
@@ -557,8 +616,13 @@ impl RendezvousServer {
                     rr.socket_addr = Default::default();
                     let id = rr.id();
                     if !id.is_empty() {
-                        let pk = self.get_pk(&rr.version, id.to_owned()).await;
-                        rr.set_pk(pk);
+                        let pk = self.get_pk_to(&rr.version, id.to_owned(), addr_b).await;
+                        match pk {
+                            Some(pk) => rr.set_pk(pk),
+                            None => return false,
+                        }
+                    } else if crate::access::on() && granted(addr_b, None).is_none() {
+                        return false;
                     }
                     let mut msg_out = RendezvousMessage::new();
                     if !rr.relay_server.is_empty() {
@@ -667,10 +731,14 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        let pk = match self.get_pk_to(&phs.version, phs.id, addr_a).await {
+            Some(pk) => pk,
+            None => return Ok(()),
+        };
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
-            pk: self.get_pk(&phs.version, phs.id).await,
+            pk,
             relay_server: phs.relay_server.clone(),
             ..Default::default()
         };
@@ -701,10 +769,14 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        let pk = match self.get_pk_to(&la.version, la.id, addr_a).await {
+            Some(pk) => pk,
+            None => return Ok(()),
+        };
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
-            pk: self.get_pk(&la.version, la.id).await,
+            pk,
             relay_server: la.relay_server,
             ..Default::default()
         };
@@ -727,7 +799,14 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if !key.is_empty() && ph.licence_key != key {
+        // access mode: only an active employee key is accepted, not the main key
+        let emp = crate::access::get(&ph.licence_key);
+        let mismatch = if crate::access::on() {
+            emp.is_none()
+        } else {
+            !key.is_empty() && ph.licence_key != key
+        };
+        if mismatch {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -756,6 +835,11 @@ impl RendezvousServer {
                 return Ok((msg_out, None));
             }
             
+            if let Some(emp) = emp.as_ref() {
+                grant(addr, Some(id.as_str()), emp);
+                log::info!("AUDIT {} {} -> {}", emp.name, addr, id);
+            }
+
             // record punch hole request (from addr -> peer id/peer_addr)
             record_punch_req(
                 try_into_v4(addr).ip().to_string(),
@@ -1264,6 +1348,28 @@ impl RendezvousServer {
                 _ => Bytes::new(),
             }
         }
+    }
+
+    // Like get_pk, but in access mode signs with the key of the employee that
+    // authorised `to`; None means the message must not be sent at all.
+    #[inline]
+    async fn get_pk_to(&mut self, version: &str, id: String, to: SocketAddr) -> Option<Bytes> {
+        if !crate::access::on() {
+            return Some(self.get_pk(version, id).await);
+        }
+        let emp = granted(to, None)?;
+        let pk = self.pm.get(&id).await?.read().await.pk.clone();
+        if pk.is_empty() {
+            return None;
+        }
+        let id_pk = hbb_common::message_proto::IdPk {
+            id,
+            pk,
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .ok()?;
+        Some(sign::sign(&id_pk, &emp.sk).into())
     }
 
     #[inline]

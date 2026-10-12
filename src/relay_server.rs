@@ -30,8 +30,14 @@ use std::{
 
 type Usage = (usize, usize, usize, usize);
 
+// Access mode: controlling side (non-empty id) and its employee key, if any
+struct Side {
+    ctrl: bool,
+    emp: Option<String>,
+}
+
 lazy_static::lazy_static! {
-    static ref PEERS: Mutex<HashMap<String, Box<dyn StreamTrait>>> = Default::default();
+    static ref PEERS: Mutex<HashMap<String, (Box<dyn StreamTrait>, Side)>> = Default::default();
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
@@ -52,6 +58,7 @@ pub async fn start_with_bind(
     key: &str,
 ) -> ResultType<()> {
     let key = get_server_sk(key)?;
+    crate::access::spawn_reloader();
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -463,13 +470,32 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
-                if !key.is_empty() && rf.licence_key != key {
+                // access mode: an active employee key is accepted besides the main key
+                let emp = crate::access::get(&rf.licence_key).map(|x| x.pk.clone());
+                if !key.is_empty() && rf.licence_key != key && emp.is_none() {
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
                 }
+                let side = Side {
+                    ctrl: !rf.id.is_empty(),
+                    emp,
+                };
                 if !rf.uuid.is_empty() {
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
-                    if let Some(peer) = peer.as_mut() {
+                    if let Some((peer, peer_side)) = peer.as_mut() {
+                        // access mode: exactly one controlling side, with an active employee key
+                        let emp = if side.ctrl {
+                            side.emp.clone()
+                        } else {
+                            peer_side.emp.clone()
+                        };
+                        if crate::access::on()
+                            && (side.ctrl == peer_side.ctrl
+                                || emp.as_ref().and_then(|x| crate::access::get(x)).is_none())
+                        {
+                            log::warn!("Relay {} from {} refused: no employee key", rf.uuid, addr);
+                            return;
+                        }
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -478,7 +504,8 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             stream.set_raw();
                             log::info!("Both are raw");
                         }
-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
+                        if let Err(err) =
+                            relay(addr, &mut stream, peer, limiter, id.clone(), emp).await
                         {
                             log::info!("Relay of {} closed: {}", addr, err);
                         } else {
@@ -487,7 +514,10 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         USAGE.write().await.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        PEERS.lock().await.insert(
+                            rf.uuid.clone(),
+                            (Box::new(stream) as Box<dyn StreamTrait>, side),
+                        );
                         sleep(30.).await;
                         PEERS.lock().await.remove(&rf.uuid);
                     }
@@ -503,6 +533,7 @@ async fn relay(
     peer: &mut Box<dyn StreamTrait>,
     total_limiter: Limiter,
     id: String,
+    emp: Option<String>,
 ) -> ResultType<()> {
     let ip = addr.ip().to_string();
     let mut tm = std::time::Instant::now();
@@ -562,6 +593,13 @@ async fn relay(
             _ = timer.tick() => {
                 if last_recv_time.elapsed().as_secs() > 30 {
                     bail!("Timeout");
+                }
+                // access mode: revoked employee key tears down the session
+                if let Some(pk) = emp.as_ref() {
+                    if crate::access::get(pk).is_none() {
+                        log::info!("Relay of {} revoked", addr);
+                        break;
+                    }
                 }
             }
         }
