@@ -1,7 +1,6 @@
 name: iqas-docker
 
-# Builds static linux/amd64 binaries (same musl/cross approach as build.yaml)
-# and pushes the classic FROM-scratch image (docker-classic/Dockerfile) to GHCR.
+# Builds linux/amd64 glibc binaries natively and pushes docker-iqas/Dockerfile (debian-slim) to GHCR.
 
 on:
   push:
@@ -15,7 +14,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: x86_64-unknown-linux-musl
 
 jobs:
   build:
@@ -30,38 +28,34 @@ jobs:
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ env.TARGET }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
       - name: Test access module
         run: cargo test --lib access
 
       - name: Build
-        run: cross build --release --target ${{ env.TARGET }}
+        run: cargo build --release
 
       - name: Prepare docker context
         run: |
           for b in hbbs hbbr rustdesk-utils; do
-            cp target/${{ env.TARGET }}/release/$b docker-classic/
+            cp target/release/$b docker-iqas/
           done
-          chmod -v a+x docker-classic/hbbs docker-classic/hbbr docker-classic/rustdesk-utils
+          chmod -v a+x docker-iqas/hbbs docker-iqas/hbbr docker-iqas/rustdesk-utils
 
       - name: Publish binaries
         uses: actions/upload-artifact@v4
         with:
           name: rustdesk-server-iqas-linux-amd64
           path: |
-            docker-classic/hbbs
-            docker-classic/hbbr
-            docker-classic/rustdesk-utils
+            docker-iqas/hbbs
+            docker-iqas/hbbr
+            docker-iqas/rustdesk-utils
           if-no-files-found: error
 
       - name: Image name
@@ -82,7 +76,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./docker-classic
+          context: ./docker-iqas
           platforms: linux/amd64
           push: true
           provenance: false
