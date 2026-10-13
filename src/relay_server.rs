@@ -497,6 +497,13 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             return;
                         }
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
+                        // iQAS: employee name captured now - after revocation the key is gone from the map
+                        let who = emp
+                            .as_ref()
+                            .and_then(|x| crate::access::get(x))
+                            .map(|e| e.name.clone())
+                            .unwrap_or_else(|| "-".to_owned());
+                        let started = std::time::Instant::now();
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
                         if !stream.is_ws() && !peer.is_ws() {
@@ -511,6 +518,16 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         } else {
                             log::info!("Relay of {} closed", addr);
                         }
+                        // iQAS: per-session traffic for accounting (USAGE total is in bits, updated ~1/s)
+                        let bits = USAGE.read().await.get(&id).map(|u| u.1).unwrap_or(0);
+                        log::info!(
+                            "AUDIT-RELAY {} {} {} {}s {}KB",
+                            who,
+                            addr,
+                            rf.uuid,
+                            started.elapsed().as_secs(),
+                            bits / 8 / 1024
+                        );
                         USAGE.write().await.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
